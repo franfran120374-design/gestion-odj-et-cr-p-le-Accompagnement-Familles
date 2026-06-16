@@ -9,6 +9,7 @@
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/docx/8.5.0/docx.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { margin:0; font-family:'Montserrat',system-ui,sans-serif; color:#333; background:#F7FBFD; }
@@ -92,14 +93,50 @@ function App(){
   const [sheetUrl,setSheetUrl]=useState("");
   const [chargementQ,setChargementQ]=useState(false); const [qErr,setQErr]=useState("");
 
-  /* persistance localStorage (OK sur GitHub Pages, ce n'est pas un artifact) */
-  useEffect(()=>{ try{ const raw=localStorage.getItem("efsf_odj"); if(raw){ const o=JSON.parse(raw); setStore(o.store||{}); if(o.sheetUrl) setSheetUrl(o.sheetUrl);} }catch(e){} },[]);
-  useEffect(()=>{ const d=store[dateKey];
-    if(d){ setTitre(d.titre); setPoints(d.points||preambule()); setQuestions(d.questions||[]); }
-    else { setTitre("Réunion hebdomadaire — Pôle Accompagnement Famille"); setPoints(preambule()); setQuestions([]); }
+  /* persistance localStorage — sans écrasement de l'ODJ en cours */
+  const chargeInitial = useRef(false);
+  const datePrecedente = useRef(dateKey);
+
+  // 1) chargement initial unique
+  useEffect(()=>{
+    try{
+      const raw=localStorage.getItem("efsf_odj");
+      if(raw){
+        const o=JSON.parse(raw);
+        const s=o.store||{};
+        setStore(s);
+        if(o.sheetUrl) setSheetUrl(o.sheetUrl);
+        const d=s[dateKey];
+        if(d){ setTitre(d.titre); setPoints(d.points||preambule()); setQuestions(d.questions||[]); }
+      }
+    }catch(e){}
+    chargeInitial.current=true;
+  },[]);
+
+  // 2) changement de date : on sauvegarde l'ancienne, on charge la nouvelle (ou préambule si neuve)
+  useEffect(()=>{
+    if(!chargeInitial.current) return;
+    if(datePrecedente.current===dateKey) return; // pas un vrai changement
+    const ancienne=datePrecedente.current;
+    setStore(prev=>{
+      const sauve={...prev,[ancienne]:{titre,points,questions}};
+      const d=sauve[dateKey];
+      if(d){ setTitre(d.titre); setPoints(d.points||preambule()); setQuestions(d.questions||[]); }
+      else { setTitre("Réunion hebdomadaire — Pôle Accompagnement Famille"); setPoints(preambule()); setQuestions([]); }
+      try{ localStorage.setItem("efsf_odj",JSON.stringify({store:sauve,sheetUrl})); }catch(e){}
+      return sauve;
+    });
+    datePrecedente.current=dateKey;
   },[dateKey]);
-  useEffect(()=>{ const merged={...store,[dateKey]:{titre,points,questions}}; setStore(merged);
-    try{ localStorage.setItem("efsf_odj",JSON.stringify({store:merged,sheetUrl})); }catch(e){}
+
+  // 3) sauvegarde continue de la date courante (ne touche jamais aux autres dates ni au mode)
+  useEffect(()=>{
+    if(!chargeInitial.current) return;
+    setStore(prev=>{
+      const merged={...prev,[dateKey]:{titre,points,questions}};
+      try{ localStorage.setItem("efsf_odj",JSON.stringify({store:merged,sheetUrl})); }catch(e){}
+      return merged;
+    });
   },[titre,points,questions,sheetUrl]);
 
   const totalDuree=useMemo(()=>points.reduce((s,p)=>s+(Number(p.duree)||0),0),[points]);
@@ -129,35 +166,73 @@ function App(){
     setQuestions(q=>[...q,{id:"q-"+Math.random().toString(36).slice(2,7),auteur:qAuteur.trim()||"Anonyme",texte:qTexte.trim()}]);
     setQAuteur(""); setQTexte(""); }
 
-  function nouveauModele(d){ setDateKey(fmtKey(d)); setMode("prep"); }
+  function nouveauModele(d){
+    const k=fmtKey(d);
+    if(k===dateKey){ setMode("prep"); return; } // déjà sur cette date, rien à faire
+    // la sauvegarde de la date courante est gérée par l'effet de changement de date
+    setDateKey(k);
+    setMode("prep");
+  }
 
   /* ---- Rafraîchir questions depuis Google Sheet ---- */
+  /* Normalise un lien Google Sheet vers le vrai CSV publié */
+  function normaliserLienCSV(u){
+    u=u.trim();
+    // déjà bon
+    if(u.includes("output=csv")) return u;
+    // page d'aperçu HTML publiée -> bascule en csv
+    if(u.includes("/pubhtml")) return u.replace("/pubhtml","/pub").replace(/([?&])$/,"") + (u.includes("?")?"&":"?") + "output=csv";
+    if(u.includes("/pub") && !u.includes("output=")) return u + (u.includes("?")?"&":"?") + "output=csv";
+    // lien d'édition classique -> export csv
+    const m=u.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if(m){ const gid=(u.match(/[?&#]gid=(\d+)/)||[])[1]; return "https://docs.google.com/spreadsheets/d/"+m[1]+"/export?format=csv"+(gid?("&gid="+gid):""); }
+    return u;
+  }
+
+  function exploiterCSV(txt){
+    // garde-fou : si on a reçu du HTML (page de login ou aperçu), on refuse
+    const debut=txt.slice(0,200).toLowerCase();
+    if(debut.includes("<!doctype")||debut.includes("<html")||debut.includes("<style")||debut.includes("servicelogin"))
+      throw new Error("HTML_RECU");
+    const rows=parseCSV(txt);
+    if(rows.length<2) { setQErr("Le tableau est accessible mais vide (aucune réponse déposée pour l'instant)."); return false; }
+    const head=rows[0].map(h=>h.toLowerCase());
+    let iP=head.findIndex(h=>h.includes("prénom")||h.includes("prenom")||h.includes("nom")||h.includes("name"));
+    let iQ=head.findIndex(h=>h.includes("question")||h.includes("point")||h.includes("sujet"));
+    if(iQ===-1) iQ=rows[0].length-1;
+    if(iP===-1) iP=Math.max(0,iQ-1);
+    const nouvelles=rows.slice(1).map((r,k)=>({
+      id:"gs-"+k, auteur:(r[iP]||"Anonyme").trim()||"Anonyme", texte:(r[iQ]||"").trim(), source:"sheet"
+    })).filter(q=>q.texte);
+    setQuestions(prev=>[...prev.filter(q=>q.source!=="sheet"),...nouvelles]);
+    return true;
+  }
+
   async function rafraichirQuestions(){
     if(!sheetUrl.trim()){ setQErr("Colle d'abord le lien CSV de ton Google Sheet ci-dessus."); return; }
     setChargementQ(true); setQErr("");
+    const url=normaliserLienCSV(sheetUrl);
+    // 1) tentative directe
     try{
-      let url=sheetUrl.trim();
-      const res=await fetch(url);
-      if(!res.ok) throw new Error("HTTP "+res.status);
-      const txt=await res.text();
-      const rows=parseCSV(txt);
-      if(rows.length<2){ setQErr("Le tableau semble vide (aucune réponse pour l'instant)."); setChargementQ(false); return; }
-      const head=rows[0].map(h=>h.toLowerCase());
-      // repérer colonnes prénom / question (souple)
-      let iP=head.findIndex(h=>h.includes("prénom")||h.includes("prenom")||h.includes("nom")||h.includes("name"));
-      let iQ=head.findIndex(h=>h.includes("question")||h.includes("point")||h.includes("sujet"));
-      if(iQ===-1) iQ=rows[0].length-1;
-      if(iP===-1) iP=Math.max(0,iQ-1);
-      const nouvelles=rows.slice(1).map((r,k)=>({
-        id:"gs-"+k, auteur:(r[iP]||"Anonyme").trim()||"Anonyme", texte:(r[iQ]||"").trim(), source:"sheet"
-      })).filter(q=>q.texte);
-      setQuestions(prev=>{
-        const manuelles=prev.filter(q=>q.source!=="sheet");
-        return [...manuelles,...nouvelles];
-      });
-    }catch(e){
-      setQErr("Échec du chargement. Vérifie que le Sheet est bien publié en CSV (voir guide). Détail : "+e.message);
-    }finally{ setChargementQ(false); }
+      const res=await fetch(url,{redirect:"follow"});
+      if(res.ok){ const txt=await res.text(); if(exploiterCSV(txt)!==false) {} setChargementQ(false); return; }
+      throw new Error("HTTP "+res.status);
+    }catch(e1){
+      // 2) fallback proxy anti-CORS (sert le fichier avec les bons en-têtes)
+      try{
+        const proxy="https://corsproxy.io/?url="+encodeURIComponent(url);
+        const res2=await fetch(proxy);
+        if(!res2.ok) throw new Error("HTTP "+res2.status);
+        const txt2=await res2.text();
+        exploiterCSV(txt2);
+      }catch(e2){
+        if(String(e1.message).includes("HTML_RECU")||String(e2.message).includes("HTML_RECU")){
+          setQErr("Le lien renvoie une page web, pas le fichier CSV. Va dans le Sheet → Fichier → Partager → Publier sur le web → format CSV, et recolle ce lien (il doit finir par output=csv).");
+        } else {
+          setQErr("Chargement impossible (Google bloque l'accès direct + le relais a échoué). Solution la plus fiable : ouvre le lien CSV dans un onglet, télécharge le fichier, ou recopie les questions à la main. Détail : "+e2.message);
+        }
+      } finally { setChargementQ(false); }
+    }
   }
 
   /* ---- Analyse IA multi-CR (uniquement dans Claude.ai) ---- */
@@ -219,9 +294,70 @@ function App(){
     a.href=url; a.download=dateKey+"_CR_Reunion_Pole_F.docx"; a.click(); URL.revokeObjectURL(url);
   }
 
+  /* ---- Export ODJ en .pptx (à ouvrir dans Google Slides) ---- */
+  async function exportODJSlides(){
+    const PG=window.PptxGenJS;
+    if(!PG){ alert("La librairie de présentation charge encore, réessaie dans 2 secondes."); return; }
+    const dFr=dateKey.replace(/_/g,"/").split("/").reverse().join("/");
+    const BLEU="7BCFF1",CORAIL="FF686D",ORANGE="FA9B5B",VERT="BED496",INK="27425A",GRIS="555555";
+    const pptx=new PG();
+    pptx.defineLayout({name:"EFSF",width:13.333,height:7.5});
+    pptx.layout="EFSF";
+
+    const coins=(s)=>{ // touches d'angle façon charte (rounded, airy)
+      s.addShape(pptx.ShapeType.rect,{x:0,y:0,w:13.333,h:0.18,fill:{color:BLEU}});
+      s.addShape(pptx.ShapeType.rect,{x:0,y:7.32,w:13.333,h:0.18,fill:{color:VERT}});
+    };
+
+    // Slide titre
+    let s=pptx.addSlide(); s.background={color:"FFFFFF"}; coins(s);
+    try{ s.addImage({data:LOGO_B64,x:5.92,y:1.1,w:1.5,h:1.62}); }catch(e){}
+    s.addText("Ordre du jour",{x:0.5,y:3.0,w:12.33,h:0.9,align:"center",fontFace:"League Spartan",fontSize:40,bold:true,color:CORAIL});
+    s.addText("Réunion hebdomadaire — Pôle Accompagnement Famille",{x:0.5,y:3.9,w:12.33,h:0.5,align:"center",fontFace:"Montserrat",fontSize:18,color:INK});
+    s.addText(dFr+"  ·  durée prévue "+totalDuree+" min",{x:0.5,y:4.5,w:12.33,h:0.4,align:"center",fontFace:"Montserrat",fontSize:14,color:ORANGE});
+    s.addText("En Faim Sans Fil (EFSF)",{x:0.5,y:6.6,w:12.33,h:0.4,align:"center",fontFace:"Montserrat",fontSize:12,color:INK});
+
+    // Slide sommaire
+    s=pptx.addSlide(); s.background={color:"FFFFFF"}; coins(s);
+    s.addText("Au programme",{x:0.7,y:0.5,w:12,h:0.7,fontFace:"League Spartan",fontSize:28,bold:true,color:BLEU});
+    const somm=points.map((p,i)=>({text:(p.categorie==="préambule"?"•":(p.categorie==="divers"?"•":i+"."))+" "+p.titre+"   ("+p.duree+" min)",
+      options:{fontFace:"Montserrat",fontSize:16,color:INK,bullet:false,paraSpaceAfter:8}}));
+    s.addText(somm,{x:0.9,y:1.4,w:11.5,h:5.5,valign:"top"});
+
+    // Une slide par point
+    const couleurCat=(c)=>c==="préambule"?BLEU:c==="divers"?CORAIL:ORANGE;
+    points.forEach((p,i)=>{
+      const sl=pptx.addSlide(); sl.background={color:"FFFFFF"}; coins(sl);
+      const cc=couleurCat(p.categorie);
+      sl.addShape(pptx.ShapeType.roundRect,{x:0.7,y:0.6,w:1.6,h:0.6,fill:{color:cc},rectRadius:0.1});
+      sl.addText((p.categorie==="préambule"?"Préambule":p.categorie==="divers"?"Divers":"Point "+i),
+        {x:0.7,y:0.6,w:1.6,h:0.6,align:"center",valign:"middle",fontFace:"Montserrat",fontSize:13,bold:true,color:"FFFFFF"});
+      sl.addText(p.duree+" min",{x:11.0,y:0.6,w:1.6,h:0.6,align:"right",fontFace:"League Spartan",fontSize:24,bold:true,color:cc});
+      sl.addText(p.titre,{x:0.7,y:1.6,w:11.9,h:1.2,fontFace:"League Spartan",fontSize:30,bold:true,color:INK,valign:"top"});
+      if(p.note) sl.addText(p.note,{x:0.7,y:2.9,w:11.9,h:3.2,fontFace:"Montserrat",fontSize:18,color:GRIS,valign:"top"});
+      if(p.src) sl.addText("↪ "+p.src,{x:0.7,y:6.5,w:11.9,h:0.4,fontFace:"Montserrat",fontSize:12,italic:true,color:VERT});
+    });
+
+    // Slide questions des bénévoles
+    if(questions.length){
+      const sq=pptx.addSlide(); sq.background={color:"FFFFFF"}; coins(sq);
+      sq.addText("Questions des bénévoles",{x:0.7,y:0.5,w:12,h:0.7,fontFace:"League Spartan",fontSize:28,bold:true,color:CORAIL});
+      const qs=questions.map(q=>({text:"• "+q.auteur+" : "+q.texte,options:{fontFace:"Montserrat",fontSize:16,color:INK,paraSpaceAfter:8}}));
+      sq.addText(qs,{x:0.9,y:1.4,w:11.5,h:5.5,valign:"top"});
+    }
+
+    // Slide clôture
+    s=pptx.addSlide(); s.background={color:BLEU}; 
+    s.addText("Merci à toutes et tous",{x:0.5,y:2.8,w:12.33,h:0.9,align:"center",fontFace:"League Spartan",fontSize:34,bold:true,color:"FFFFFF"});
+    s.addText("Pôle Accompagnement Famille · En Faim Sans Fil",{x:0.5,y:3.8,w:12.33,h:0.5,align:"center",fontFace:"Montserrat",fontSize:16,color:"FFFFFF"});
+    s.addText("familles@enfaimsansfil.org",{x:0.5,y:4.3,w:12.33,h:0.4,align:"center",fontFace:"Montserrat",fontSize:13,color:"FFFFFF"});
+
+    await pptx.writeFile({fileName:dateKey+"_ODJ_Reunion_Pole_F.pptx"});
+  }
+
   return (
     <div style={{maxWidth:1080,margin:"0 auto",padding:16}}>
-      <Entete {...{mode,setMode,dateKey,setDateKey,store,nouveauModele,exportCR}}/>
+      <Entete {...{mode,setMode,dateKey,setDateKey,store,nouveauModele,exportCR,exportODJSlides}}/>
       {mode==="prep" ?
         <Preparation {...{titre,setTitre,points,maj,supprimer,deplacer,totalDuree,reste,ajusterAuTotal,ajouterDivers,
           biblio,ajouterPoint,newTitre,setNewTitre,newDuree,setNewDuree,newNote,setNewNote,submitManuel,
@@ -236,7 +372,7 @@ function App(){
   );
 }
 
-function Entete({mode,setMode,dateKey,setDateKey,store,nouveauModele,exportCR}){
+function Entete({mode,setMode,dateKey,setDateKey,store,nouveauModele,exportCR,exportODJSlides}){
   const jeudi=prochainJeudi();
   return (
     <div style={{background:"#fff",borderRadius:16,border:"1px solid "+C.bleu,padding:"16px 20px",marginBottom:16}}>
@@ -259,6 +395,7 @@ function Entete({mode,setMode,dateKey,setDateKey,store,nouveauModele,exportCR}){
         <span style={{fontSize:12,background:C.bleuPale,padding:"4px 10px",borderRadius:8}}>Clé : <b>{dateKey}</b></span>
         <button onClick={()=>nouveauModele(jeudi)} style={btn(C.vert)}>+ Modèle du prochain jeudi ({fmtKey(jeudi)})</button>
         <button onClick={exportCR} style={btn(C.corail)}>⬇ Générer le CR pré-rempli (.docx)</button>
+        <button onClick={exportODJSlides} style={btn(C.orange)}>⬇ Exporter l'ODJ (.pptx → Slides)</button>
       </div>
       <div style={{fontSize:12,color:C.ink,marginTop:6}}>📅 {fmtFr(new Date(dateKey.replace(/_/g,"-")+"T12:00:00"))}
         {Object.keys(store).length>1 && <span style={{marginLeft:12}}>· Modèles enregistrés : {Object.keys(store).join(" · ")}</span>}
@@ -305,6 +442,9 @@ function Preparation(p){
             <input placeholder="Lien CSV publié du Google Sheet…" value={sheetUrl} onChange={e=>setSheetUrl(e.target.value)} style={{...inp("100%"),marginBottom:6}}/>
             <button onClick={rafraichirQuestions} disabled={chargementQ} style={{...btn(C.bleu),width:"100%",opacity:chargementQ?0.6:1}}>
               {chargementQ?"Chargement…":"🔄 Rafraîchir les questions des bénévoles"}
+            </button>
+            <button onClick={()=>setQuestions(prev=>prev.filter(q=>q.source!=="sheet"))} style={{...btn(C.orange),width:"100%",marginTop:6,fontSize:12}}>
+              🧹 Vider les questions importées
             </button>
             {qErr && <div style={{fontSize:12,color:C.corail,marginTop:6}}>{qErr}</div>}
           </div>
