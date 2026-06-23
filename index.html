@@ -94,7 +94,10 @@ function App(){
   const [importMsg,setImportMsg]=useState("");
 
   /* Google Sheet questions */
-  const [sheetUrl,setSheetUrl]=useState("");
+  const [sheetUrl,setSheetUrl]=useState(()=>{
+    try{ const raw=localStorage.getItem("efsf_odj"); if(raw){ const o=JSON.parse(raw); if(o.sheetUrl) return o.sheetUrl; } }catch(e){}
+    return "https://docs.google.com/spreadsheets/d/e/2PACX-1vRm-mwnqdHWy6QsHIUjLVb9Wr8-uEN8Nykz6YQnAZb4bPOv_hrZWzA58kklaXJ3gKYtiAc-IAwrIEqn/pub?gid=52759568&single=true&output=csv";
+  });
   const [chargementQ,setChargementQ]=useState(false); const [qErr,setQErr]=useState("");
 
   /* Bénévoles du Pôle Accompagnement Famille */
