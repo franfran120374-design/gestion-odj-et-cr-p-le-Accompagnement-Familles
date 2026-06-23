@@ -97,6 +97,14 @@ function App(){
   const [sheetUrl,setSheetUrl]=useState("");
   const [chargementQ,setChargementQ]=useState(false); const [qErr,setQErr]=useState("");
 
+  /* Bénévoles du Pôle Accompagnement Famille */
+  const [beneficiaires,setBeneficiaires]=useState(()=>{
+    try{ const raw=localStorage.getItem("efsf_odj"); if(raw){ const o=JSON.parse(raw); if(Array.isArray(o.beneficiaires)) return o.beneficiaires; } }catch(e){}
+    return ["Sandra MERCIER","Mélissa","Constance"];
+  });
+  const [nouveauBeneficiaire,setNouveauBeneficiaire]=useState("");
+  const [exportMsg,setExportMsg]=useState("");
+
   /* persistance localStorage — sans écrasement de l'ODJ en cours */
   const chargeInitial = useRef(false);
   const datePrecedente = useRef(dateKey);
@@ -111,6 +119,7 @@ function App(){
         setStore(s);
         if(o.sheetUrl) setSheetUrl(o.sheetUrl);
         if(Array.isArray(o.archiveCR)) setArchiveCR(o.archiveCR);
+        if(Array.isArray(o.beneficiaires)) setBeneficiaires(o.beneficiaires);
         const d=s[dateKey];
         if(d){ setTitre(d.titre); setPoints(d.points||preambule()); setQuestions(d.questions||[]); }
       }
@@ -128,7 +137,7 @@ function App(){
       const d=sauve[dateKey];
       if(d){ setTitre(d.titre); setPoints(d.points||preambule()); setQuestions(d.questions||[]); }
       else { setTitre("Réunion hebdomadaire — Pôle Accompagnement Famille"); setPoints(preambule()); setQuestions([]); }
-      try{ localStorage.setItem("efsf_odj",JSON.stringify({store:sauve,sheetUrl,archiveCR})); }catch(e){}
+      try{ localStorage.setItem("efsf_odj",JSON.stringify({store:sauve,sheetUrl,archiveCR,beneficiaires})); }catch(e){}
       return sauve;
     });
     datePrecedente.current=dateKey;
@@ -139,10 +148,10 @@ function App(){
     if(!chargeInitial.current) return;
     setStore(prev=>{
       const merged={...prev,[dateKey]:{titre,points,questions}};
-      try{ localStorage.setItem("efsf_odj",JSON.stringify({store:merged,sheetUrl,archiveCR})); }catch(e){}
+      try{ localStorage.setItem("efsf_odj",JSON.stringify({store:merged,sheetUrl,archiveCR,beneficiaires})); }catch(e){}
       return merged;
     });
-  },[titre,points,questions,sheetUrl,archiveCR]);
+  },[titre,points,questions,sheetUrl,archiveCR,beneficiaires]);
 
   const totalDuree=useMemo(()=>points.reduce((s,p)=>s+(Number(p.duree)||0),0),[points]);
   const reste=TOTAL_CIBLE-totalDuree;
@@ -177,6 +186,88 @@ function App(){
     // la sauvegarde de la date courante est gérée par l'effet de changement de date
     setDateKey(k);
     setMode("prep");
+  }
+
+  /* ---- Gestion des bénévoles ---- */
+  const [beneficiaireEdit,setBeneficiaireEdit]=useState(null); // index en cours d'édition
+  const [beneficiaireEditVal,setBeneficiaireEditVal]=useState("");
+  function ajouterBeneficiaire(){
+    const n=nouveauBeneficiaire.trim();
+    if(!n||beneficiaires.some(b=>b.toLowerCase()===n.toLowerCase())){ setNouveauBeneficiaire(""); return; }
+    setBeneficiaires(prev=>[...prev,n]); setNouveauBeneficiaire("");
+  }
+  function supprimerBeneficiaire(idx){ setBeneficiaires(prev=>prev.filter((_,i)=>i!==idx)); }
+  function debuterEditBeneficiaire(idx){ setBeneficiaireEdit(idx); setBeneficiaireEditVal(beneficiaires[idx]); }
+  function validerEditBeneficiaire(){
+    const n=beneficiaireEditVal.trim();
+    if(!n||beneficiaires.some((b,i)=>i!==beneficiaireEdit&&b.toLowerCase()===n.toLowerCase())){
+      setBeneficiaireEdit(null); return;
+    }
+    setBeneficiaires(prev=>prev.map((b,i)=>i===beneficiaireEdit?n:b));
+    setBeneficiaireEdit(null);
+  }
+
+  /* ---- Extraction de tâches ODJ vers bénévoles ---- */
+  function extraireTaches(){
+    const taches=points.filter(p=>!p.fixe&&p.categorie!=="préambule").map(p=>{
+      const bSel=Array.isArray(p.beneficiaires)?p.beneficiaires:(p.beneficiaire?[p.beneficiaire]:[]);
+      return {
+        id:p.id, titre:p.titre, duree:p.duree, note:p.note||"", categorie:p.categorie, src:p.src||"",
+        beneficiaires:bSel, statut:p.statut||"à faire"
+      };
+    });
+    if(!taches.length){ return null; }
+    return taches;
+  }
+
+  /* ---- Export CSV local des tâches assignées ---- */
+  function exporterTachesCSV(){
+    const taches=extraireTaches();
+    if(!taches){ setExportMsg("Aucune tâche à exporter."); setTimeout(()=>setExportMsg(""),3000); return; }
+    const dFr=dateKey.replace(/_/g,"-");
+    const header="Date Réunion;Titre;Durée (min);Note;Bénévoles;Statut;Source ODJ;Catégorie";
+    const rows=taches.map(t=>[
+      dFr,
+      '"'+t.titre.replace(/"/g,'""')+'"',
+      t.duree,
+      '"'+t.note.replace(/"/g,'""')+'"',
+      '"'+t.beneficiaires.join(", ")+'"',
+      t.statut,
+      '"'+t.src.replace(/"/g,'""')+'"',
+      t.categorie
+    ].join(";"));
+    const csv="\uFEFF"+header+"\n"+rows.join("\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download=dateKey+"_Taches_Pole_Famille.csv"; a.click(); URL.revokeObjectURL(url);
+    setExportMsg(taches.length+" tâche(s) exportée(s) en CSV.");
+    setTimeout(()=>setExportMsg(""),4000);
+  }
+
+  /* ---- Export JSON local des tâches assignées ---- */
+  function exporterTachesJSON(){
+    const taches=extraireTaches();
+    if(!taches){ setExportMsg("Aucune tâche à exporter."); setTimeout(()=>setExportMsg(""),3000); return; }
+    const dFr=dateKey.replace(/_/g,"-");
+    const payload={
+      action:"ajouterTaches",
+      source:"EFSF_Pole_Famille_ODJ",
+      dateReunion:dFr,
+      dateExtraction:new Date().toISOString(),
+      beneficiaires:beneficiaires,
+      taches:taches.map(t=>({
+        titre:t.titre, duree:t.duree, note:t.note, categorie:t.categorie,
+        sourceODJ:t.src, beneficiaires:t.beneficiaires, statut:t.statut
+      }))
+    };
+    const json=JSON.stringify(payload,null,2);
+    const blob=new Blob([json],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download=dateKey+"_Taches_Pole_Famille.json"; a.click(); URL.revokeObjectURL(url);
+    setExportMsg(taches.length+" tâche(s) exportée(s) en JSON (prêt pour Google Apps Script).");
+    setTimeout(()=>setExportMsg(""),4000);
   }
 
   /* ---- Rafraîchir questions depuis Google Sheet ---- */
@@ -422,7 +513,10 @@ function App(){
           biblio,setBiblio,selBiblio,setSelBiblio,ajouterPoint,newTitre,setNewTitre,newDuree,setNewDuree,newNote,setNewNote,submitManuel,
           questions,setQuestions,qAuteur,setQAuteur,qTexte,setQTexte,submitQuestion,
           crTexte,setCrTexte,analyserCR,analyseEnCours,analyseErr,archiveCR,ajouterCRTexte,importerDocx,supprimerCR,extractionLocale,importMsg,
-          sheetUrl,setSheetUrl,rafraichirQuestions,chargementQ,qErr}}/>
+          sheetUrl,setSheetUrl,rafraichirQuestions,chargementQ,qErr,
+          beneficiaires,setBeneficiaires,nouveauBeneficiaire,setNouveauBeneficiaire,ajouterBeneficiaire,supprimerBeneficiaire,
+          beneficiaireEdit,setBeneficiaireEdit,beneficiaireEditVal,setBeneficiaireEditVal,debuterEditBeneficiaire,validerEditBeneficiaire,
+          exporterTachesCSV,exporterTachesJSON,exportMsg}}/>
         : <Seance {...{points,titre,dateKey,totalDuree}}/> }
       <footer style={{marginTop:28,paddingTop:12,borderTop:"2px solid "+C.bleu,fontSize:12,color:C.ink,textAlign:"center"}}>
         Sandra MERCIER · Référente Pôle Accompagnement Famille · En Faim Sans Fil (EFSF) · familles@enfaimsansfil.org
@@ -468,7 +562,10 @@ function Preparation(p){
     biblio,setBiblio,selBiblio,setSelBiblio,ajouterPoint,newTitre,setNewTitre,newDuree,setNewDuree,newNote,setNewNote,submitManuel,
     questions,setQuestions,qAuteur,setQAuteur,qTexte,setQTexte,submitQuestion,
     crTexte,setCrTexte,analyserCR,analyseEnCours,analyseErr,archiveCR,ajouterCRTexte,importerDocx,supprimerCR,extractionLocale,importMsg,
-    sheetUrl,setSheetUrl,rafraichirQuestions,chargementQ,qErr}=p;
+    sheetUrl,setSheetUrl,rafraichirQuestions,chargementQ,qErr,
+    beneficiaires,setBeneficiaires,nouveauBeneficiaire,setNouveauBeneficiaire,ajouterBeneficiaire,supprimerBeneficiaire,
+    beneficiaireEdit,setBeneficiaireEdit,beneficiaireEditVal,setBeneficiaireEditVal,debuterEditBeneficiaire,validerEditBeneficiaire,
+    exporterTachesCSV,exporterTachesJSON,exportMsg}=p;
   return (
     <div className="grille" style={{display:"grid",gridTemplateColumns:"1fr 330px",gap:16,alignItems:"start"}}>
       <div>
@@ -476,7 +573,7 @@ function Preparation(p){
           <input value={titre} onChange={e=>setTitre(e.target.value)} style={{...inp("100%"),fontWeight:600,marginBottom:12}}/>
           <BarreTemps total={totalDuree} reste={reste} ajuster={ajusterAuTotal}/>
           <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:12}}>
-            {points.map((pt,i)=><LignePoint key={pt.id} p={pt} index={i} maj={maj} supprimer={supprimer} deplacer={deplacer}/>)}
+            {points.map((pt,i)=><LignePoint key={pt.id} p={pt} index={i} maj={maj} supprimer={supprimer} deplacer={deplacer} beneficiaires={beneficiaires}/>)}
           </div>
           {!points.some(x=>x.categorie==="divers") &&
             <button onClick={ajouterDivers} style={{...btn(C.vert),marginTop:12}}>+ Ajouter le point « Divers » (clôture 10 min)</button>}
@@ -522,6 +619,46 @@ function Preparation(p){
                 </div>
               ))}
             </div>}
+        </Carte>
+
+        <Carte couleur={C.vert} titre="👥 Bénévoles & Tâches">
+          <div style={{fontSize:12,color:"#777",marginBottom:8}}>Gère la liste des bénévoles du Pôle et assigne les tâches de l'ODJ.</div>
+          <div style={{display:"flex",gap:6,marginBottom:8}}>
+            <input placeholder="Ajouter un bénévole…" value={nouveauBeneficiaire} onChange={e=>setNouveauBeneficiaire(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&ajouterBeneficiaire()} style={{...inp("100%"),flex:1}}/>
+            <button onClick={ajouterBeneficiaire} style={btn(C.vert)}>+</button>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:10}}>
+            {beneficiaires.map((b,i)=>(
+              <div key={i} style={{display:"flex",alignItems:"center",gap:4,background:C.vertPale,border:"1px solid "+C.vert,borderRadius:8,padding:"4px 8px",fontSize:12}}>
+                {beneficiaireEdit===i ? (
+                  <>
+                    <input value={beneficiaireEditVal} onChange={e=>setBeneficiaireEditVal(e.target.value)}
+                      onKeyDown={e=>e.key==="Enter"&&validerEditBeneficiaire()}
+                      style={{...inp("100%"),flex:1,fontSize:12,padding:"2px 6px"}} autoFocus/>
+                    <button onClick={validerEditBeneficiaire} style={{border:"none",background:C.vert,color:"#fff",borderRadius:4,cursor:"pointer",fontSize:10,padding:"2px 6px"}}>✓</button>
+                    <button onClick={()=>setBeneficiaireEdit(null)} style={{border:"none",background:"transparent",cursor:"pointer",fontSize:10,color:"#999"}}>✕</button>
+                  </>
+                ) : (
+                  <>
+                    <span style={{flex:1}}>{b}</span>
+                    <button onClick={()=>debuterEditBeneficiaire(i)} style={{border:"none",background:"transparent",cursor:"pointer",fontSize:10,color:C.bleu}} title="Modifier">✏️</button>
+                    <button onClick={()=>supprimerBeneficiaire(i)} style={{border:"none",background:"transparent",cursor:"pointer",fontSize:10,color:C.corail}} title="Supprimer">✕</button>
+                  </>
+                )}
+              </div>
+            ))}
+            {beneficiaires.length===0 && <span style={{fontSize:12,color:"#999",fontStyle:"italic"}}>Aucun bénévole enregistré.</span>}
+          </div>
+          <div style={{borderTop:"1px solid #E3EEF3",paddingTop:10}}>
+            <div style={{fontSize:12,fontWeight:600,color:C.ink,marginBottom:6}}>📋 Points assignés : {points.filter(p=>p.beneficiaires&&p.beneficiaires.length&&!p.fixe).length} / {points.filter(p=>!p.fixe).length}</div>
+            <div style={{fontSize:11,color:"#777",marginBottom:8}}>Coche les bénévoles sur chaque point de l'ODJ, puis exporte la liste des tâches.</div>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={exporterTachesCSV} style={{...btn(C.bleu),flex:1,fontSize:12}}>⬇ CSV</button>
+              <button onClick={exporterTachesJSON} style={{...btn(C.orange),flex:1,fontSize:12}}>⬇ JSON</button>
+            </div>
+            {exportMsg && <div style={{fontSize:12,color:C.vert,marginTop:6,fontWeight:600}}>{exportMsg}</div>}
+          </div>
         </Carte>
       </div>
 
@@ -607,8 +744,14 @@ function BarreTemps({total,reste,ajuster}){
   );
 }
 
-function LignePoint({p,index,maj,supprimer,deplacer}){
+function LignePoint({p,index,maj,supprimer,deplacer,beneficiaires}){
   const cc=p.categorie==="préambule"?C.bleu:p.categorie==="divers"?C.corail:C.orange;
+  const statutCouleur=p.statut==="terminé"?C.vert:p.statut==="en cours"?C.orange:C.bleu;
+  const sel=Array.isArray(p.beneficiaires)?p.beneficiaires:[];
+  function toggleBeneficiaire(nom){
+    const nouveau=sel.includes(nom)?sel.filter(b=>b!==nom):[...sel,nom];
+    maj(p.id,"beneficiaires",nouveau);
+  }
   return (
     <div style={{display:"flex",gap:8,alignItems:"flex-start",background:"#fff",border:"1px solid #E3EEF3",borderLeft:"4px solid "+cc,borderRadius:10,padding:"8px 10px"}}>
       <div style={{display:"flex",flexDirection:"column",gap:2,paddingTop:2}}>
@@ -619,6 +762,22 @@ function LignePoint({p,index,maj,supprimer,deplacer}){
         <input value={p.titre} onChange={e=>maj(p.id,"titre",e.target.value)} style={{...inp("100%"),fontWeight:600,border:"none",padding:"2px 0",color:C.ink}}/>
         <textarea value={p.note} onChange={e=>maj(p.id,"note",e.target.value)} placeholder="note…" style={{width:"100%",border:"none",fontSize:12,color:"#777",resize:"vertical",height:p.note?"auto":22,fontFamily:"inherit",background:"transparent"}}/>
         {p.src && <span style={{fontSize:11,color:C.vert}}>↪ {p.src}</span>}
+        {!p.fixe && <div style={{marginTop:6}}>
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:4}}>
+            {beneficiaires.map(b=>(
+              <label key={b} style={{display:"inline-flex",alignItems:"center",gap:3,fontSize:11,cursor:"pointer",background:sel.includes(b)?C.bleuPale:"#f5f5f5",border:"1px solid "+(sel.includes(b)?C.bleu:"#ddd"),borderRadius:6,padding:"2px 6px"}}>
+                <input type="checkbox" checked={sel.includes(b)} onChange={()=>toggleBeneficiaire(b)} style={{margin:0,cursor:"pointer"}}/>
+                {b}
+              </label>
+            ))}
+          </div>
+          <select value={p.statut||"à faire"} onChange={e=>maj(p.id,"statut",e.target.value)}
+            style={{fontSize:11,padding:"2px 6px",borderRadius:6,border:"1px solid "+statutCouleur,background:statutCouleur+"22",color:statutCouleur,fontWeight:600}}>
+            <option value="à faire">📋 À faire</option>
+            <option value="en cours">🔄 En cours</option>
+            <option value="terminé">✅ Terminé</option>
+          </select>
+        </div>}
       </div>
       <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
         <div style={{display:"flex",alignItems:"center",gap:4}}>
